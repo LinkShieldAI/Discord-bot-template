@@ -1,3 +1,8 @@
+# Exact hostnames to bypass scanning; subdomains must be listed explicitly.
+# Original entries are retained. Review them before use, especially shorteners
+# and sites hosting user content. Empty this file to scan every URL.
+# Blank lines and # comments are supported. Restart the bot after changes.
+
 1password.com
 500px.com
 9to5google.com

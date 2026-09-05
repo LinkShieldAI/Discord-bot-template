@@ -1,81 +1,86 @@
-import asyncio
-import json
-import os
+"""URL extraction and local allowlist matching. These helpers make no requests."""
+
 import re
-import time
+from pathlib import Path
+from urllib.parse import urlsplit
 
-import aiohttp
-
-url_pattern = re.compile(r'(?P<url>https?://[^\s]+[-a-zA-Z0-9@:%_+~#?&/=]+)')
-
-
-# TODO add headers for requests from your bot
-
-
-async def get_final_url(shortened_url):
-    start_time = time.time()
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(shortened_url, allow_redirects=True) as response:
-                final_url = str(response.url)
-                end_time = time.time()
-                duration = end_time - start_time
-                return final_url, duration
-    except aiohttp.ClientError as e:
-        print("Error occurred:", e)
-        end_time = time.time()
-        duration = end_time - start_time
-        return shortened_url, duration
+# Handles explicit HTTP(S) links, including <autolinks> and Markdown destinations.
+# Lookahead also finds adjacent Markdown links and URLs nested in query strings.
+URL_PATTERN = re.compile(r"(?=(https?://[^\s<>]+))", re.IGNORECASE)
+AUTHORITY_PATTERN = re.compile(r"https?://[^/?#]*", re.IGNORECASE)
+HOST_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 
 
-async def extract_links(text):
-    links = url_pattern.findall(text)
+def extract_links(text: str) -> list[str]:
+    """Return distinct URLs in message order, removing surrounding punctuation."""
+    links = []
+    for match in URL_PATTERN.finditer(text):
+        url = match.group(1)
+        # Angle brackets explicitly delimit a URL; preserve everything inside them.
+        prefix = text[: match.start()]
+        if prefix.endswith("<"):
+            if url not in links:
+                links.append(url)
+            continue
+        # Remove paired message formatting, never punctuation inside a URL.
+        if prefix.endswith("||") and url.endswith("||"):
+            url = url[:-2]
+        elif prefix and prefix[-1] in "\"'`" and url.endswith(prefix[-1]):
+            url = url[:-1]
+
+        # Punctuation in userinfo must not hide the real host after @.
+        # Inspect the whole authority before trimming any Markdown delimiters.
+        userinfo_end = AUTHORITY_PATTERN.match(url).group().rfind("@")
+        # Preserve balanced parentheses in paths, e.g. Wikipedia's /wiki/Foo_(bar).
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            depth = 0
+            for index, character in enumerate(url):
+                if index <= userinfo_end:
+                    continue
+                if character == opening:
+                    depth += 1
+                elif character == closing:
+                    if depth == 0:
+                        url = url[:index]
+                        break
+                    depth -= 1
+        url = url.rstrip(".,!;:")
+        if url and url not in links:
+            links.append(url)
     return links
 
 
-async def truncate_url(url, max_length=30):
-    if len(url) > max_length:
-        return url[:max_length - 3] + "..."
-    else:
-        return url
+def load_safe_domains(path: Path) -> set[str]:
+    """Load exact ASCII hostnames; a missing or invalid file stops startup."""
+    domains = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        domain = line.split("#", 1)[0].strip().lower().removesuffix(".")
+        if not domain:
+            continue
+        if len(domain) > 253 or not all(
+            HOST_PATTERN.fullmatch(label) for label in domain.split(".")
+        ):
+            raise ValueError(
+                f"{path.name}:{line_number}: expected a hostname, not a URL or wildcard."
+            )
+        domains.add(domain)
+    return domains
 
 
-async def read_config(server_id):
-    config_file = f"server_configs/{server_id}.json"
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            return json.load(f)
-    else:
-        return {}
-
-
-async def write_config(server_id, config):
-    config_file = f"server_configs/{server_id}.json"
+def is_allowlisted(url: str, safe_domains: set[str]) -> bool:
+    """Match the actual hostname exactly, never text elsewhere in a URL."""
+    # Backslashes and control characters can be interpreted differently by browsers.
+    if "\\" in url or any(ord(character) <= 32 or ord(character) == 127 for character in url):
+        return False
     try:
-        with open(config_file, "w") as f:
-            json.dump(config, f, indent=4)
-    except FileNotFoundError:
-        print(f"Error: File '{config_file}' not found.")
-    except PermissionError:
-        print(f"Error: Permission denied to write to '{config_file}'.")
-    except Exception as e:
-        print(f"Error: An unexpected error occurred: {e}")
-
-
-async def check_mal(url, API_key):
-    API_ENDPOINT = f'https://api.linkshieldai.com/?key={API_key}&url={url}'
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(API_ENDPOINT, timeout=35) as response:
-                if response.status == 200:
-                    data = await response.json()
-
-                    result = data.get('result', "Failed to connect to the site.")
-
-                    if result == "Might be malicious":
-                        return True
-                    else:
-                        return False
-        except asyncio.TimeoutError:
-            print("Couldn't connect to the API.")
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        _ = parsed.port  # Reject malformed and out-of-range ports.
+        hostname = parsed.hostname.lower().removesuffix(".")
+    except ValueError:
+        return False
+    # Unicode hosts are submitted for scanning; no lossy Unicode-to-ASCII folding.
+    return hostname.isascii() and hostname in safe_domains
